@@ -8,8 +8,22 @@ import streamlit.components.v1 as components
 
 st.set_page_config(page_title="CarePathIQ", layout="wide", page_icon="🏥")
 
-st.title("🏥 CarePathIQ — Clinical Pathway Agent")
-st.markdown("A multi-phase UI to build evidence-based clinical pathways.")
+st.title("Clinical Pathway Agent")
+st.markdown("A multi-phase, conversational assistant to build evidence-based clinical pathways.")
+
+# --- Conversational dialogue library (restored from CLI prompts) ---
+dialogue = {
+    "intro": "Hello! I'm your Clinical Pathway Agent. I'm here to help you transform your clinical expertise and evidence-based medicine into a robust clinical pathway.",
+    "phase_1_start": "Let's kick things off with the Scope. I'll ask you a few questions to frame the problem accurately.",
+    "phase_2_intro": "Great job on the scope. Now, let's look at the science. We need to make sure our pathway is evidence-based. Ready to evaluate some evidence?",
+    "phase_3_intro": "Now let's map out the logic. We need to ensure every decision point is clear and supported by the evidence we just gathered.",
+    "phase_4_intro": "A pathway only works if people actually use it. Let's simulate the workflow.",
+    "phase_5_intro": "We're in the home stretch. Now we need to operationalize this—turning a paper document into a live clinical tool.",
+    "step_verification": "I've finished gathering inputs for this section. Please review the summary preview above.",
+    "approval_request": ">> Do you approve this section? (Type 'YES' to proceed, anything else to abort): ",
+    "locked": "Section approved. Updating Documentation...",
+    "summary_generated": "The formal summary has been saved to '{filename}'."
+}
 
 # --- API key input (UI-first template) ---
 openai_api_key = st.sidebar.text_input("OpenAI API Key", type="password")
@@ -33,6 +47,141 @@ if 'pathway_data' not in st.session_state:
         'operations': {},
         'mermaid': ''
     }
+
+# Conversational assistant state
+if 'assistant_messages' not in st.session_state:
+    st.session_state.assistant_messages = [
+        {'role': 'assistant', 'content': 'Hello — I can help you build a clinical pathway. Ask me for phase guidance or type a question.'}
+    ]
+
+def append_assistant_message(role, content):
+    st.session_state.assistant_messages.append({'role': role, 'content': content})
+# Assistant panel moved below after helper functions are defined
+
+def summarize_pathway():
+    """Return a concise summary (LLM-assisted if key present) of `st.session_state.pathway_data`.
+
+    Includes: scope, evidence bank (top 5), and mermaid code (if any).
+    """
+    data = st.session_state.pathway_data
+    scope = data.get('scope', {})
+    sb = []
+    sb.append('Summary of Clinical Pathway:')
+    cond = scope.get('condition') or 'Not specified'
+    sb.append(f"- Condition: {cond}")
+    sb.append(f"- Population: {scope.get('population','Not specified')}")
+    sb.append(f"- Setting: {scope.get('setting','Not specified')}")
+    objectives = scope.get('objectives', [])
+    if objectives:
+        sb.append('- Objectives:')
+        for o in objectives:
+            sb.append(f"  - {o}")
+    else:
+        sb.append('- Objectives: None specified')
+
+    evidence = data.get('evidence', [])
+    if evidence:
+        sb.append(f"- Evidence bank ({len(evidence)} items), top entries:")
+        for e in evidence[:5]:
+            point = e.get('point','')
+            cite = e.get('citation','')
+            ver = e.get('verification','')
+            sb.append(f"  - {point} — {cite} — {ver}")
+    else:
+        sb.append('- Evidence bank: empty')
+
+    mermaid = data.get('mermaid','').strip()
+    if mermaid:
+        sb.append('- Mermaid flowchart code included (trimmed):')
+        sb.append('\n'.join(mermaid.splitlines()[:20]))
+    else:
+        sb.append('- Mermaid flowchart: none')
+
+    plaintext = '\n'.join(sb)
+
+    # If LLM available, ask it to rewrite/condense the summary
+    if client:
+        prompt = (
+            "Please produce a concise, user-facing summary of the clinical pathway data below. "
+            "Keep it to 4-6 short bullet points and highlight any missing information.\n\n" + plaintext
+        )
+        llm_reply = ask_assistant(prompt, context='You are a concise clinical pathway assistant.')
+        # If LLM returned something meaningful, prefer it
+        if llm_reply and not llm_reply.startswith('LLM error'):
+            return llm_reply
+
+    return plaintext
+
+
+# ------------------- Conversational Phase Runner -------------------
+if 'current_phase' not in st.session_state:
+    st.session_state.current_phase = 1
+
+def append_phase_message(msg):
+    append_assistant_message('assistant', msg)
+
+def propose_structure_from_scope():
+    condition = st.session_state.pathway_data.get('scope', {}).get('condition','the condition')
+    return [
+        {"type": "Start Node", "name": f"Patient presents with {condition}"},
+        {"type": "Decision Node", "name": "Risk Stratification / Severity Assessment"},
+        {"type": "Note", "name": "Clinical Risk Score Details (e.g., Calculator)"},
+        {"type": "Process Step", "name": "Initial Medical Management"},
+        {"type": "End Node", "name": "Disposition (Admit vs. Discharge)"}
+    ]
+
+def auto_run_phase_2():
+    """Automatically search PubMed for proposed decision elements and save evidence."""
+    data = st.session_state.pathway_data
+    condition = data.get('scope', {}).get('condition', 'Clinical')
+    elements = propose_structure_from_scope()
+    evidence_bank = []
+    append_phase_message(f"Running automated PubMed searches for {len(elements)} elements...")
+    for item in elements:
+        point = item['name']
+        query = f"({condition}) AND ({point}) AND (Guideline[pt] OR Systematic Review[pt])"
+        results = search_pubmed(query, retmax=2)
+        if results:
+            chosen = results[0]
+            evidence_bank.append({'id': chosen, 'decision_point': point, 'element_type': item['type']})
+            append_phase_message(f"Found evidence for '{point}': {chosen}")
+        else:
+            append_phase_message(f"No API hits for '{point}', please add manual citation.")
+            evidence_bank.append({'id': 'MANUAL_REQUIRED', 'decision_point': point, 'element_type': item['type']})
+    data.setdefault('evidence', {})
+    data['evidence']['studies'] = evidence_bank
+    st.session_state.pathway_data = data
+    append_phase_message('Evidence bank updated with automated search results.')
+
+def auto_run_phase_3():
+    """Generate mermaid flowchart from evidence nodes."""
+    data = st.session_state.pathway_data
+    studies = data.get('evidence', {}).get('studies', [])
+    nodes = [s.get('decision_point') for s in studies if s.get('decision_point')]
+    entry = data.get('logic', {}).get('entry') or (st.session_state.pathway_data.get('scope',{}).get('condition','Entry'))
+    exit_pt = data.get('logic', {}).get('endpoints') or 'Disposition'
+    if not nodes:
+        append_phase_message('No decision nodes available to generate flowchart. Add evidence first.')
+        return
+    code = generate_mermaid(entry, nodes, exit_pt)
+    st.session_state.pathway_data['mermaid'] = code
+    append_phase_message('Mermaid flowchart generated from evidence nodes.')
+
+def run_phase(phase):
+    if phase == 1:
+        # Use the conversational prompt from dialogue
+        append_phase_message(dialogue.get('phase_1_start'))
+    elif phase == 2:
+        append_phase_message(dialogue.get('phase_2_intro'))
+        auto_run_phase_2()
+    elif phase == 3:
+        append_phase_message(dialogue.get('phase_3_intro'))
+        auto_run_phase_3()
+    elif phase == 4:
+        append_phase_message(dialogue.get('phase_4_intro'))
+    elif phase == 5:
+        append_phase_message(dialogue.get('phase_5_intro'))
+
 
 def search_pubmed(query, retmax=3):
     base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
@@ -82,6 +231,34 @@ def generate_mermaid(entry, nodes, exit_point):
     prompt = f"Create a Mermaid.js flowchart (graph TD) for Entry: {entry} Nodes: {nodes} Exit: {exit_point}. Output only raw graph TD code."
     return ask_assistant(prompt, context='You are a clinical pathway visual designer.').replace('```mermaid','').replace('```','').strip()
 
+# Assistant chat panel (placed after helper functions so dependencies exist)
+with st.expander('Assistant — conversational help', expanded=True):
+    for msg in st.session_state.assistant_messages:
+        try:
+            st.chat_message(msg['role']).write(msg['content'])
+        except Exception:
+            st.write(f"**{msg['role'].title()}:** {msg['content']}")
+
+    user_q = st.chat_input('Ask the assistant about the workflow or the current phase')
+    if user_q:
+        append_assistant_message('user', user_q)
+        if 'summarize' in user_q.lower() or 'summary' in user_q.lower():
+            try:
+                summary = summarize_pathway()
+            except Exception as e:
+                summary = f'Error generating summary: {e}'
+            append_assistant_message('assistant', summary)
+        else:
+            reply = ask_assistant(user_q)
+            append_assistant_message('assistant', reply)
+
+    if st.button('Summarize current pathway'):
+        try:
+            summary = summarize_pathway()
+        except Exception as e:
+            summary = f'Error generating summary: {e}'
+        append_assistant_message('assistant', summary)
+
 # --- UI Tabs ---
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["1. Scope & Charter","2. Evidence Appraisal","3. Logic & Visuals","4. User Testing","5. Final Report"])
 
@@ -96,6 +273,14 @@ with tab1:
         if st.form_submit_button('Save Charter'):
             st.session_state.pathway_data['scope'] = {'condition':cond,'population':pop,'setting':setting,'problem':problem,'objectives':[o for o in objectives.split('\n') if o.strip()]}
             st.success('Scope saved')
+        # Phase controls
+        if st.form_submit_button('Auto-run Phase 1 (Guidance)'):
+            run_phase(1)
+        if st.form_submit_button('Get guidance (Assistant)'):
+            append_phase_message(dialogue.get('phase_1_start'))
+        if st.form_submit_button('Next: Go to Phase 2'):
+            st.session_state.current_phase = 2
+            run_phase(2)
 
 with tab2:
     st.header('Phase 2 — Rapid Evidence Appraisal')
@@ -120,6 +305,15 @@ with tab2:
         else:
             st.warning('No citations found — try manual entry')
 
+    # Phase controls
+    if st.button('Auto-run Phase 2 (Automated Evidence Search)'):
+        run_phase(2)
+    if st.button('Get guidance (Assistant)'):
+        append_phase_message(dialogue.get('phase_2_intro'))
+    if st.button('Next: Go to Phase 3'):
+        st.session_state.current_phase = 3
+        run_phase(3)
+
     if st.session_state.pathway_data['evidence']:
         st.markdown('### Evidence Bank')
         for i,e in enumerate(st.session_state.pathway_data['evidence']):
@@ -142,6 +336,15 @@ with tab3:
             st.session_state.pathway_data['logic'] = {'entry':entry_pt,'endpoints':exit_pt,'nodes':nodes}
             st.success('Mermaid generated')
 
+    # Phase controls
+    if st.button('Auto-run Phase 3 (Generate from Evidence)'):
+        run_phase(3)
+    if st.button('Get guidance (Assistant)'):
+        append_phase_message(dialogue.get('phase_3_intro'))
+    if st.button('Next: Go to Phase 4'):
+        st.session_state.current_phase = 4
+        run_phase(4)
+
     if st.session_state.pathway_data.get('mermaid'):
         mermaid_html = f"""
         <script type="module">
@@ -161,6 +364,15 @@ with tab4:
         st.session_state.pathway_data['testing'] = {'issues':heur,'mitigation':mitig,'status':'Saved'}
         st.success('Testing feedback saved')
 
+    # Phase controls
+    if st.button('Auto-run Phase 4 (Testing Guidance)'):
+        run_phase(4)
+    if st.button('Get guidance (Assistant)'):
+        append_phase_message(dialogue.get('phase_4_intro'))
+    if st.button('Next: Go to Phase 5'):
+        st.session_state.current_phase = 5
+        run_phase(5)
+
 with tab5:
     st.header('Phase 5 — Final Report')
     if st.button('Compile Final Report'):
@@ -176,6 +388,61 @@ with tab5:
         st.markdown('### Preview')
         st.markdown(md)
         st.download_button('Download Report (MD)', data=md, file_name='clinical_pathway.md', mime='text/markdown')
+    if st.button('Auto-run Phase 5 (Compile & Summary)'):
+        run_phase(5)
+    if st.button('Get guidance (Assistant)'):
+        append_phase_message(dialogue.get('phase_5_intro'))
 
 st.sidebar.markdown('---')
 st.sidebar.write('CarePathIQ — minimal Streamlit implementation')
+
+# Detailed checklist UI in the sidebar
+if 'checklist_overrides' not in st.session_state:
+    st.session_state.checklist_overrides = {}
+
+def get_default_checks():
+    data = st.session_state.pathway_data
+    scope = data.get('scope', {})
+    logic = data.get('logic', {})
+    return [
+        bool(scope.get('condition')),
+        bool(scope.get('problem')),
+        bool(scope.get('objectives')),
+        bool(data.get('evidence')),
+        bool(logic.get('nodes')),
+        bool(data.get('mermaid','').strip()),
+    ]
+
+check_labels = [
+    'Scope — Condition defined',
+    'Scope — Problem statement written',
+    'Scope — SMART objectives documented',
+    'Evidence — At least one citation added',
+    'Logic — Decision nodes defined',
+    'Visuals — Mermaid flowchart generated',
+]
+
+defaults = get_default_checks()
+checked_count = 0
+checkbox_keys = []
+st.sidebar.markdown('**Progress Checklist**')
+for i,label in enumerate(check_labels, start=1):
+    key = f'check_{i}'
+    checkbox_keys.append(key)
+    default = st.session_state.checklist_overrides.get(key, defaults[i-1])
+    val = st.sidebar.checkbox(label, value=default, key=key)
+    # Store overrides when the user changes a checkbox
+    if val != defaults[i-1]:
+        st.session_state.checklist_overrides[key] = val
+    else:
+        # remove override if it matches default
+        st.session_state.checklist_overrides.pop(key, None)
+    if val:
+        checked_count += 1
+
+total_checks = len(check_labels)
+percent = int((checked_count / total_checks) * 100) if total_checks else 0
+st.sidebar.metric('Progress', f'{percent}%')
+st.sidebar.progress(percent)
+st.sidebar.write(f'{checked_count}/{total_checks} sections complete')
+
