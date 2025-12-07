@@ -83,7 +83,7 @@ class ClinicalPathwayAgent:
         full_prompt = f"{context}\n\nTask: {prompt}"
         try:
             response = self.client.chat.completions.create(
-                model="gpt-4",
+                model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": full_prompt}],
                 temperature=0.3
             )
